@@ -70,10 +70,11 @@ export async function listSnapshots() {
     if (!Array.isArray(batch) || batch.length === 0) break;
     for (const rel of batch) {
       if (typeof rel.tag_name !== "string") continue;
-      if (
-        !rel.tag_name.startsWith(MANUAL_PREFIX) &&
-        !rel.tag_name.startsWith(AUTO_PREFIX)
-      ) {
+      // Accept our two historical prefixes AND the current plain "snap-" prefix.
+      // Getting this wrong is not cosmetic: the boot probe would see "no
+      // backups", start the app on an empty database, and let it overwrite the
+      // good remote backup on its next cycle.
+      if (!rel.tag_name.startsWith("snap-")) {
         continue;
       }
       out.push({
