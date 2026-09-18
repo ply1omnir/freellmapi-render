@@ -69,6 +69,7 @@ const state = {
   lastError: null,
   appPid: null,
   appExits: 0,
+  fastExits: 0,
   degraded: false,
 };
 
@@ -185,23 +186,53 @@ async function publish(payload) {
 }
 
 // ── boot probe ───────────────────────────────────────────────────────────────
+// The app's own backup format: magic "FAPIBK1\0" + iv(12) + tag(16) + ciphertext.
+// We never decrypt, but we DO verify the magic: serving a foreign or truncated
+// artifact to the app makes it refuse to start (correctly, fail-closed), which
+// without this check turns into an endless crash-restart loop.
+const BACKUP_MAGIC = Buffer.from("FAPIBK1\u0000", "binary");
+const MIN_BACKUP_BYTES = 7 + 12 + 16;
+
+function looksLikeAppBackup(buf) {
+  return (
+    Buffer.isBuffer(buf) &&
+    buf.length >= MIN_BACKUP_BYTES &&
+    buf.subarray(0, BACKUP_MAGIC.length).equals(BACKUP_MAGIC)
+  );
+}
+
 async function bootProbe() {
   for (let attempt = 0; attempt <= BOOT_DELAYS_MS.length; attempt++) {
     try {
-      const rel = await latestSnapshot();
-      if (!rel) {
+      const all = await listSnapshots();
+      const withAssets = all.filter(function (r) {
+        return r.assets.length > 0;
+      });
+      if (withAssets.length === 0) {
         // A reachable repository that simply holds no backup yet.
         log("no backup in " + configRepo() + " yet — treating as FIRST BOOT");
         state.boot = "first-boot";
         return;
       }
-      const asset = rel.assets[0];
-      const buf = await downloadAsset(asset.id);
-      state.payload = buf;
-      state.loadedTag = rel.tag;
-      state.boot = "loaded";
-      log("loaded backup " + rel.tag + " (" + buf.length + " bytes)");
-      return;
+      const rejected = [];
+      for (const rel of withAssets) {
+        const buf = await downloadAsset(rel.assets[0].id);
+        if (looksLikeAppBackup(buf)) {
+          state.payload = buf;
+          state.loadedTag = rel.tag;
+          state.boot = "loaded";
+          log("loaded backup " + rel.tag + " (" + buf.length + " bytes)");
+          return;
+        }
+        rejected.push(rel.tag);
+        log("skipping " + rel.tag + ": not a FreeLLMAPI backup (bad magic)");
+      }
+      // Assets exist but none is a usable backup. Starting the app now would
+      // run it on an empty database and let it overwrite a good backup later,
+      // so this is a hard stop that needs a human.
+      throw new Error(
+        "found " + withAssets.length + " asset(s) but none is a valid backup: " + rejected.join(", ")
+      );
     } catch (err) {
       state.bootError = scrub(err && err.message ? err.message : err);
       log("boot probe attempt " + (attempt + 1) + " failed: " + state.bootError);
@@ -366,17 +397,26 @@ function startApp() {
     FREEAPI_DB_BACKUP_TOKEN: BACKUP_TOKEN,
     FREEAPI_DB_BACKUP_INTERVAL_MS: String(BACKUP_INTERVAL_MS),
   });
+  const startedAt = Date.now();
   app = spawn(process.execPath, [APP_ENTRY], { cwd: APP_CWD, env: childEnv, stdio: "inherit" });
   state.appPid = app.pid;
   log("app started pid=" + app.pid + " on port " + PORT + " (backup interval " + BACKUP_INTERVAL_MS + "ms)");
   app.on("exit", function (code, signal) {
     state.appExits++;
     state.appPid = null;
-    log("app exited code=" + code + " signal=" + signal);
-    if (!shuttingDown) {
-      log("restarting app in 3s");
-      setTimeout(startApp, 3000);
+    const uptimeMs = Date.now() - startedAt;
+    log("app exited code=" + code + " signal=" + signal + " after " + Math.round(uptimeMs / 1000) + "s");
+    if (shuttingDown) return;
+    // Back off on repeated fast failures: a crash loop that respawns every 3s
+    // burns the instance and floods the logs without ever getting healthier.
+    if (uptimeMs < 15000) {
+      state.fastExits++;
+    } else {
+      state.fastExits = 0;
     }
+    const delay = Math.min(60000, 3000 * Math.pow(2, Math.min(state.fastExits, 4)));
+    log("restarting app in " + Math.round(delay / 1000) + "s (consecutive fast exits: " + state.fastExits + ")");
+    setTimeout(startApp, delay);
   });
 }
 
