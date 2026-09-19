@@ -1,0 +1,56 @@
+# FreeLLMAPI on Render (free tier) + optional masking layer
+#
+# 与 Dockerfile（无脱敏版本）并存：Render 服务的 Dockerfile Path 二选一，
+# 回滚只需改回 "Dockerfile"，**不新建第二个服务**。
+#
+# 本镜像 = 官方 FreeLLMAPI 镜像 + 可选的 maskit 脱敏引擎（mitmproxy 插件）。
+# 脱敏层由 entrypoint.mjs 按 MASK_ENABLED 决定是否启动：
+#   MASK_ENABLED=true  → /v1,/v1beta 经 mitmdump 打码后转发给容器内 FreeLLMAPI
+#   MASK_ENABLED=false → 不启动 mitmdump，行为等同无脱敏版本（省 ~85MB / ~12s 冷启动）
+#
+# 为什么用 uv 装 Python 3.12：
+#   官方基座是 node:20-bookworm-slim（Debian 12 → python3 = 3.11），
+#   而 mitmproxy 11/12 都要求 Python >= 3.12；
+#   bookworm-backports 没有 python3.12（已核实），故改用 uv 的独立 CPython（免编译）。
+#
+# 信任域：mitmdump 只绑 127.0.0.1:19081（MASK_PORT），公网只有 entrypoint 的路由层。
+# 不含任何密钥；密钥仍全部由 Render 环境变量注入。
+
+FROM ghcr.io/tashfeenahmed/freellmapi:latest
+
+USER root
+
+# ── Python 3.12 + mitmproxy（脱敏引擎运行时）────────────────────────────────
+ENV UV_INSTALL_DIR=/usr/local/bin \
+    UV_PYTHON_INSTALL_DIR=/opt/pythons \
+    UV_NO_PROGRESS=1
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends curl ca-certificates; \
+    curl -LsSf https://astral.sh/uv/install.sh | sh; \
+    uv python install 3.12; \
+    uv venv --python 3.12 /opt/maskit; \
+    uv pip install --python /opt/maskit/bin/python --no-cache 'mitmproxy==12.2.3'; \
+    /opt/maskit/bin/mitmdump --version; \
+    apt-get purge -y curl; \
+    apt-get autoremove -y; \
+    rm -rf /var/lib/apt/lists/* /root/.cache /tmp/*
+
+# ── 应用与脱敏引擎源码 ──────────────────────────────────────────────────────
+COPY --chown=node:node entrypoint.mjs github.mjs /app/
+# maskit 引擎（AGPL-3.0，未修改，来源与许可见 maskit/NOTICE.md）
+COPY --chown=node:node maskit/ /app/maskit/
+
+# 脱敏默认开启；想临时关掉只需在 Render 改环境变量 MASK_ENABLED=false（无需改代码/换镜像）
+ENV MASK_ENABLED=true \
+    APP_PORT=3001 \
+    MASK_PORT=19081 \
+    MASK_FAIL_MODE=closed \
+    MASK_PATHS=/v1,/v1beta \
+    MASKIT_BIN=/opt/maskit/bin/mitmdump \
+    MASKIT_ENGINE=/app/maskit/transparent.py \
+    MASKIT_DATA=/tmp/maskit
+
+# 注意：Render 控制台里 Health Check Path 必须留空（沿用无脱敏版本的经验：
+# HTTP 健康检查的 5 秒超时会把偶发卡顿的免费实例判死且停在 502）。
+CMD ["node", "/app/entrypoint.mjs"]
