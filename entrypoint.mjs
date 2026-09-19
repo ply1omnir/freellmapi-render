@@ -26,6 +26,9 @@
 //     exposed to the public 500 page.
 
 import http from "node:http";
+import net from "node:net";
+import fs from "node:fs";
+import path from "node:path";
 import { spawn } from "node:child_process";
 import {
   configRepo,
@@ -55,6 +58,30 @@ const MAX_BODY_BYTES = 64 * 1024 * 1024;
 const BOOT_DELAYS_MS = [5000, 10000, 20000, 30000, 30000, 30000];
 const DAY_MS = 24 * 60 * 60 * 1000;
 
+// ── optional masking layer (maskit engine, panel not used) ───────────────────
+// MASK_ENABLED=false (the default) keeps the public surface identical to the
+// pre-masking deployment, except that $PORT is now served by this router and
+// the app listens on APP_PORT. Turning masking on/off is a config change only:
+// no code change, no second Render service.
+const MASK_ENABLED = /^(1|true|yes|on)$/i.test(String(process.env.MASK_ENABLED || "false"));
+const MASK_FAIL_MODE =
+  String(process.env.MASK_FAIL_MODE || "closed").toLowerCase() === "passthrough" ? "passthrough" : "closed";
+const MASK_PATHS = String(process.env.MASK_PATHS || "/v1,/v1beta")
+  .split(",")
+  .map(function (s) {
+    return s.trim();
+  })
+  .filter(Boolean);
+const APP_PORT = Number(process.env.APP_PORT || 3001);
+const MASK_PORT = Number(process.env.MASK_PORT || 19081);
+const MASKIT_BIN = process.env.MASKIT_BIN || "/opt/maskit/bin/mitmdump";
+const MASKIT_ENGINE = process.env.MASKIT_ENGINE || "/app/maskit/transparent.py";
+const MASKIT_DATA = process.env.MASKIT_DATA || "/tmp/maskit";
+// First-run account creation is gated by the app on the *socket* peer address,
+// which is always loopback once this router sits in front. Keep it closed to
+// the public side unless an operator explicitly opts in.
+const ALLOW_PUBLIC_SETUP = /^(1|true|yes|on)$/i.test(String(process.env.ALLOW_PUBLIC_SETUP || "false"));
+
 const state = {
   startedAt: new Date().toISOString(),
   boot: "pending",
@@ -71,6 +98,14 @@ const state = {
   appExits: 0,
   fastExits: 0,
   degraded: false,
+  // masking layer (only meaningful when MASK_ENABLED is true)
+  maskEnabled: MASK_ENABLED,
+  maskReady: false,
+  maskPid: null,
+  maskExits: 0,
+  maskFastExits: 0,
+  maskLastError: null,
+  routed: { masked: 0, direct: 0, gate503: 0, setupBlocked: 0 },
 };
 
 function log(msg) {
@@ -356,6 +391,12 @@ function startStatusServer() {
       lastError: state.lastError,
       appPid: state.appPid,
       appExits: state.appExits,
+      maskEnabled: state.maskEnabled,
+      maskReady: state.maskReady,
+      maskPid: state.maskPid,
+      maskExits: state.maskExits,
+      maskLastError: state.maskLastError,
+      routed: state.routed,
       uptimeSec: Math.round(process.uptime()),
     });
   });
@@ -386,21 +427,35 @@ function startDegradedServer() {
 
 // ── app supervision ──────────────────────────────────────────────────────────
 let app = null;
+let maskit = null;
 let shuttingDown = false;
 
 function startApp() {
   const childEnv = Object.assign({}, process.env, {
-    PORT: String(PORT),
+    // The app no longer owns the public port — this router does. The app binds
+    // APP_PORT and only ever sees loopback traffic (from the router, or from
+    // the masking engine when it is enabled).
+    PORT: String(APP_PORT),
     HOSTNAME: "0.0.0.0",
     DATA_DIR: APP_DATA_DIR,
     FREEAPI_DB_BACKUP_TARGET: "http://127.0.0.1:" + RECEIVER_PORT + "/backup",
     FREEAPI_DB_BACKUP_TOKEN: BACKUP_TOKEN,
     FREEAPI_DB_BACKUP_INTERVAL_MS: String(BACKUP_INTERVAL_MS),
   });
+  // Exactly one proxy hop now sits in front of the app, so its client-IP
+  // resolution must trust that hop. X-Forwarded-For is forwarded unchanged,
+  // which keeps its rightmost entry (the real client) authoritative.
+  if (childEnv.TRUST_PROXY === undefined) childEnv.TRUST_PROXY = "1";
   const startedAt = Date.now();
   app = spawn(process.execPath, [APP_ENTRY], { cwd: APP_CWD, env: childEnv, stdio: "inherit" });
   state.appPid = app.pid;
-  log("app started pid=" + app.pid + " on port " + PORT + " (backup interval " + BACKUP_INTERVAL_MS + "ms)");
+  log("app started pid=" + app.pid + " on 127.0.0.1:" + APP_PORT + " (backup interval " + BACKUP_INTERVAL_MS + "ms)");
+  app.on("error", function (err) {
+    // A spawn failure (missing entry, EACCES…) must not take this process down:
+    // the router still has to answer, and the supervisor still has to retry.
+    state.lastError = scrub("app spawn error: " + (err && err.message ? err.message : err));
+    log(state.lastError);
+  });
   app.on("exit", function (code, signal) {
     state.appExits++;
     state.appPid = null;
@@ -431,6 +486,13 @@ function shutdown(reason) {
       // ignore
     }
   }
+  if (maskit && !maskit.killed) {
+    try {
+      maskit.kill("SIGTERM");
+    } catch (e) {
+      // ignore
+    }
+  }
   setTimeout(function () {
     process.exit(0);
   }, 1500);
@@ -443,8 +505,303 @@ process.on("SIGINT", function () {
   shutdown("SIGINT");
 });
 
+// ── masking layer: mitmdump + maskit's transparent.py (panel intentionally omitted) ──
+// The engine is vendored into this image (AGPL-3.0, see /app/maskit/NOTICE.md). It
+// binds MASK_PORT on loopback only; this router is the sole way to reach it.
+const HOP_BY_HOP = [
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+];
+
+function peerIp(req) {
+  const addr = req.socket && req.socket.remoteAddress ? req.socket.remoteAddress : "";
+  return String(addr).replace(/^::ffff:/, "") || "unknown";
+}
+
+function pathMatches(urlPath, prefix) {
+  const p = String(urlPath || "").split("?", 1)[0];
+  const pre = String(prefix || "").replace(/\/+$/, "");
+  return !!pre && (p === pre || p.indexOf(pre + "/") === 0);
+}
+
+function isMaskedPath(urlPath) {
+  return MASK_PATHS.some(function (p) {
+    return pathMatches(urlPath, p);
+  });
+}
+
+function probePort(port, cb) {
+  const sock = net.connect({ host: "127.0.0.1", port: port });
+  let done = false;
+  function finish(ok) {
+    if (done) return;
+    done = true;
+    try { sock.destroy(); } catch (e) { /* ignore */ }
+    cb(ok);
+  }
+  sock.setTimeout(400);
+  sock.once("connect", function () { finish(true); });
+  sock.once("timeout", function () { finish(false); });
+  sock.once("error", function () { finish(false); });
+}
+
+function startMaskProbe() {
+  function tick() {
+    probePort(MASK_PORT, function (ok) {
+      if (ok !== state.maskReady) {
+        state.maskReady = ok;
+        log("masking engine " + (ok ? "READY" : "NOT READY") + " on 127.0.0.1:" + MASK_PORT);
+      }
+    });
+    setTimeout(tick, state.maskReady ? 5000 : 1000).unref();
+  }
+  tick();
+}
+
+function writeMaskitConfig() {
+  fs.mkdirSync(path.join(MASKIT_DATA, "conf"), { recursive: true });
+  const cfg = {
+    capture_mode: "reverse",
+    // reverse mode routes by inbound port, so no domain allow-list is used.
+    target_domains: [],
+    domains_disabled: [],
+    api_paths: MASK_PATHS,
+    sensitive: {},
+    sensitive_disabled: [],
+    sensitive_word_disabled: {},
+    sensitive_word_whole: [],
+    builtin_rules: {
+      PRIVATE_KEY: true, CONNSTR: true, PHONE: true, EMAIL: true, IDCARD: true,
+      LANDLINE: true, API_KEY: true, ACCESS_KEY: true, JWT: true, TOKEN: true,
+      SECRET: true, CARD: true, IP_PRIVATE: true,
+    },
+    secret_prefixes: ["sk-", "ah-"],
+    debug: false,
+    // NER needs an ONNX runtime that is deliberately not shipped here.
+    ner_enabled: false,
+    diagnostic_unmatched: false,
+    session_ttl: 600,
+    http2: false,
+    upstreams: [
+      {
+        name: "freellm",
+        base_path: "/",
+        port: MASK_PORT,
+        target: "http://127.0.0.1:" + APP_PORT,
+        paths: MASK_PATHS,
+        use_proxy: false,
+        extra_headers: {},
+      },
+    ],
+    filter_enabled: true,
+    // fail_closed: never let an unparsable body through unmasked — block it.
+    fail_closed: true,
+    response_scan: true,
+    origin_check: false,
+    record_plaintext_words: false,
+    ext_bridge_enabled: false,
+    ext_token: "",
+    ext_block_when_engine_down: false,
+    ext_record_events: false,
+    stream_response: true,
+    stream_exclude_hosts: [],
+    stop_mode: "passthrough",
+    egress_proxy: { enabled: false, url: "" },
+    model_prices: {},
+    price_sync_enabled: false,
+    log_retention_days: 1,
+    autostart: false,
+    start_minimized: true,
+    auto_start_proxy: false,
+    wizard_done: true,
+    audit: {
+      enabled: false,
+      passive: true,
+      active_probes: false,
+      severity_floor: "MEDIUM",
+      auto_report: false,
+      signals: {
+        error_leak: true, identity_swap: true, tool_call_rewrite: true,
+        sse_anomaly: true, response_poison: true, cross_request_pollution: true,
+        dangerous_action: true,
+      },
+    },
+  };
+  fs.writeFileSync(path.join(MASKIT_DATA, "config.json"), JSON.stringify(cfg, null, 2) + "\n");
+  log("wrote masking config to " + path.join(MASKIT_DATA, "config.json") + " (paths: " + MASK_PATHS.join(", ") + ")");
+}
+
+function startMaskit() {
+  try {
+    writeMaskitConfig();
+  } catch (err) {
+    state.maskLastError = scrub(err && err.message ? err.message : err);
+    log("masking config write failed: " + state.maskLastError);
+  }
+  const args = [
+    "-s", MASKIT_ENGINE,
+    "--mode", "regular@127.0.0.1:" + MASK_PORT,
+    "--set", "confdir=" + path.join(MASKIT_DATA, "conf"),
+    "--set", "flow_detail=0",
+    "--set", "termlog_verbosity=warn",
+    "--set", "connection_strategy=lazy",
+    "--set", "http2=false",
+  ];
+  const childEnv = Object.assign({}, process.env, {
+    LLM_SHIELD_DATA_DIR: MASKIT_DATA,
+    PYTHONUNBUFFERED: "1",
+  });
+  const startedAt = Date.now();
+  try {
+    maskit = spawn(MASKIT_BIN, args, { cwd: MASKIT_DATA, env: childEnv, stdio: "inherit" });
+  } catch (err) {
+    state.maskLastError = scrub(err && err.message ? err.message : err);
+    log("masking engine spawn threw: " + state.maskLastError);
+    return;
+  }
+  state.maskPid = maskit.pid;
+  log("masking engine started pid=" + maskit.pid + " on 127.0.0.1:" + MASK_PORT + " (" + MASKIT_ENGINE + ")");
+  maskit.on("error", function (err) {
+    state.maskLastError = scrub(err && err.message ? err.message : err);
+    log("masking engine error: " + state.maskLastError);
+  });
+  maskit.on("exit", function (code, signal) {
+    state.maskExits++;
+    state.maskPid = null;
+    state.maskReady = false;
+    const uptimeMs = Date.now() - startedAt;
+    log("masking engine exited code=" + code + " signal=" + signal + " after " + Math.round(uptimeMs / 1000) + "s");
+    if (shuttingDown) return;
+    if (uptimeMs < 15000) state.maskFastExits++;
+    else state.maskFastExits = 0;
+    const delay = Math.min(60000, 2000 * Math.pow(2, Math.min(state.maskFastExits, 5)));
+    log("restarting masking engine in " + Math.round(delay / 1000) + "s (fast exits: " + state.maskFastExits + ")");
+    setTimeout(function () {
+      if (!shuttingDown) startMaskit();
+    }, delay);
+  });
+}
+
+// ── public router (owns $PORT) ───────────────────────────────────────────────
+function proxyTo(targetPort, req, res) {
+  const headers = Object.assign({}, req.headers);
+  for (const h of HOP_BY_HOP) delete headers[h];
+  // Render's edge already appends the real client IP to X-Forwarded-For; pass it
+  // through untouched so its rightmost entry stays authoritative, and synthesise
+  // one only when the edge sent none.
+  if (!headers["x-forwarded-for"]) headers["x-forwarded-for"] = peerIp(req);
+  if (!headers["x-forwarded-proto"]) headers["x-forwarded-proto"] = "https";
+  if (!headers["x-forwarded-host"] && req.headers.host) headers["x-forwarded-host"] = req.headers.host;
+  if (!headers["x-real-ip"]) headers["x-real-ip"] = peerIp(req);
+
+  let answered = false;
+  const upstream = http.request(
+    { host: "127.0.0.1", port: targetPort, method: req.method, path: req.url, headers: headers },
+    function (upRes) {
+      answered = true;
+      try {
+        res.writeHead(upRes.statusCode || 502, upRes.headers);
+      } catch (e) {
+        try { res.destroy(); } catch (e2) { /* ignore */ }
+        return;
+      }
+      upRes.pipe(res);
+      upRes.on("error", function () {
+        try { res.destroy(); } catch (e) { /* ignore */ }
+      });
+    }
+  );
+  upstream.on("error", function (err) {
+    const msg = scrub(err && err.message ? err.message : err);
+    if (answered) {
+      try { res.destroy(); } catch (e) { /* ignore */ }
+      return;
+    }
+    answered = true;
+    state.lastError = "proxy to 127.0.0.1:" + targetPort + " failed: " + msg;
+    log(state.lastError);
+    try {
+      res.writeHead(502, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
+      res.end(JSON.stringify({ error: "bad_gateway" }));
+    } catch (e) { /* ignore */ }
+  });
+  req.on("aborted", function () {
+    try { upstream.destroy(); } catch (e) { /* ignore */ }
+  });
+  res.on("close", function () {
+    if (!res.writableEnded) {
+      try { upstream.destroy(); } catch (e) { /* ignore */ }
+    }
+  });
+  req.pipe(upstream);
+}
+
+function startRouter() {
+  const server = http.createServer(function (req, res) {
+    const urlPath = String(req.url || "/").split("?", 1)[0];
+    const method = String(req.method || "GET").toUpperCase();
+
+    // Defence in depth: the app treats a loopback peer as "same machine" and
+    // waives the first-run setup code. Behind this router every peer looks
+    // loopback, so that endpoint must not be reachable from the public side.
+    if (!ALLOW_PUBLIC_SETUP && method === "POST" && urlPath === "/api/auth/setup") {
+      state.routed.setupBlocked++;
+      log("blocked public POST /api/auth/setup (set ALLOW_PUBLIC_SETUP=1 to permit)");
+      res.writeHead(403, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
+      res.end(JSON.stringify({ error: "setup_disabled_on_public_surface" }));
+      return;
+    }
+
+    if (!(MASK_ENABLED && isMaskedPath(urlPath))) {
+      state.routed.direct++;
+      proxyTo(APP_PORT, req, res);
+      return;
+    }
+    if (state.maskReady) {
+      state.routed.masked++;
+      proxyTo(MASK_PORT, req, res);
+      return;
+    }
+    if (MASK_FAIL_MODE === "passthrough") {
+      state.routed.direct++;
+      log("masking not ready — passthrough " + method + " " + urlPath);
+      proxyTo(APP_PORT, req, res);
+      return;
+    }
+    state.routed.gate503++;
+    res.writeHead(503, {
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store",
+      "Retry-After": "5",
+    });
+    res.end(JSON.stringify({ error: "masking_engine_unavailable", retryAfterSeconds: 5 }));
+  });
+  server.on("clientError", function (_e, socket) {
+    try { socket.destroy(); } catch (e) { /* ignore */ }
+  });
+  server.listen(PORT, "0.0.0.0", function () {
+    log(
+      "router listening on 0.0.0.0:" + PORT +
+        " (mask=" + (MASK_ENABLED ? "on" : "off") + " fail=" + MASK_FAIL_MODE +
+        " app=127.0.0.1:" + APP_PORT + ")"
+    );
+  });
+  return server;
+}
+
 async function main() {
-  log("booting: PORT=" + PORT + " receiver=127.0.0.1:" + RECEIVER_PORT + " repo=" + (process.env.GITHUB_CONFIG_REPO || "(unset)"));
+  log(
+    "booting: PORT=" + PORT + " app=127.0.0.1:" + APP_PORT +
+      " mask=" + (MASK_ENABLED ? "on" : "off") +
+      " receiver=127.0.0.1:" + RECEIVER_PORT +
+      " repo=" + (process.env.GITHUB_CONFIG_REPO || "(unset)")
+  );
   await bootProbe();
   if (state.degraded) {
     startDegradedServer();
@@ -452,7 +809,12 @@ async function main() {
   }
   startReceiver();
   startStatusServer();
+  if (MASK_ENABLED) {
+    startMaskit();
+    startMaskProbe();
+  }
   startApp();
+  startRouter();
 }
 
 main().catch(function (err) {
